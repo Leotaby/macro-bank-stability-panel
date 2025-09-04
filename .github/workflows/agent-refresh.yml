@@ -1,0 +1,85 @@
+name: Agent Refresh (rebuild & PR)
+
+on:
+  workflow_dispatch: {}   # run it manually from the Actions tab
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed for PR creation
+      pull-requests: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Validate data
+        run: python -m src.cli --check-data
+
+      - name: Build figures
+        run: python -m src.cli --figures
+
+      - name: Build tables
+        run: python -m src.cli --tables
+
+      - name: Smoke test (capture)
+        id: smoke
+        run: |
+          echo "OUTPUT<<EOF" >> $GITHUB_OUTPUT
+          python -m src.cli --smoke-test >> $GITHUB_OUTPUT 2>&1 || true
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: List artifacts
+        id: listing
+        run: |
+          echo "FILES<<EOF" >> $GITHUB_OUTPUT
+          ls -R outputs || true >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Lint (non-blocking)
+        run: |
+          python -m black --check src || true
+          python -m isort --check-only src || true
+
+      - name: Create PR with refreshed artifacts
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: refresh figures & tables"
+          title: "Auto-refresh: figures & tables (${{ github.event.repository.updated_at }})"
+          branch: auto/update-artifacts
+          delete-branch: true
+          add-paths: |
+            outputs/**
+            src/**
+          body: |
+            This PR refreshes generated artifacts.
+
+            ## Smoke test
+            ```
+            ${{ steps.smoke.outputs.OUTPUT }}
+            ```
+
+            ## Generated files
+            ```
+            ${{ steps.listing.outputs.FILES }}
+            ```
+
+            _Notes:_ FE = two-way (entity & time) with clustered SEs; AB-GMM runs when panel depth allows.
