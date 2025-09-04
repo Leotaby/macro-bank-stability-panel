@@ -1,4 +1,4 @@
-name: Agent Refresh (rebuild & PR)
+name:  Refresh (rebuild & PR)
 
 on:
   workflow_dispatch: {}   # run it manually from the Actions tab
