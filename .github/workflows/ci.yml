@@ -26,6 +26,6 @@ jobs:
           pip install -r requirements.txt
           pip install ruff pytest
       - name: Lint with ruff
-        run: ruff src tests
+          run: ruff .
       - name: Run tests
         run: pytest -q
