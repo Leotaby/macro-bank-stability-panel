@@ -1,0 +1,10 @@
+repos:
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.1.6
+    hooks:
+      - id: ruff
+        args: [--line-length=88]
+  - repo: https://github.com/pytest-dev/pytest
+    rev: 7.3.1
+    hooks:
+      - id: pytest
