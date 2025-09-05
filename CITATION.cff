@@ -1,0 +1,23 @@
+# Citation file for macrobank stability panel project
+
+cff-version: 1.2.0
+title: "Macrobank Stability Panel"
+message: "If you use this project, please cite it."
+authors:
+  - family-names: Taby
+    given-names: Leo
+    affiliation: "University / Institution"
+    orcid: "0000-0000-0000-0000"
+
+version: "0.1.0"
+date-released: "2025-09-05"
+doi: "10.0000/example.doi"
+url: "https://github.com/Leotaby/macro-bank-stability-panel"
+
+references:
+  - type: software
+    title: "Ruff"
+    url: "https://github.com/astral-sh/ruff"
+  - type: software
+    title: "pytest"
+    url: "https://docs.pytest.org/"
