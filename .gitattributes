@@ -1,0 +1,8 @@
+# Configure Git LFS for large files
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.xlsx filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+
+# Track processed data via LFS
+data/processed/* filter=lfs diff=lfs merge=lfs -text
