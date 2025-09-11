@@ -1,18 +1,13 @@
+.PHONY: setup data figures fe
+
 setup:
-	python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && pre-commit install
-
-lint:
-	ruff src tests
-
-test:
-	pytest
+\tpython -m venv .venv && . .venv/bin/activate && pip install -U pip && pip install -r requirements.txt
 
 data:
-	python src/macrobank/build_data.py
+\t. .venv/bin/activate && python src/macrobank/build_data.py
 
-figures:
-	python src/macrobank/make_figures.py
+figures: data
+\t. .venv/bin/activate && python src/macrobank/make_figures.py
 
-all: data figures lint test
-
-.PHONY: setup lint test data figures all
+fe: data
+\t. .venv/bin/activate && python src/macrobank/fe_models.py
