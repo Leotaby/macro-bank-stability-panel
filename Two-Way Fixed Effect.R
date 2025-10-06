@@ -1,33 +1,46 @@
-options(stringsAsFactors = FALSE)
+options(stringsAsFactors = FALSE, na.action = "na.omit")
 set.seed(2024)
 
-# ===== Dependencies =====
-pkgs <- c("plm","readr","dplyr","stringr","broom","ggplot2","tidyr","purrr")
+## ===== Dependencies =====
+pkgs <- c("plm","readr","dplyr","stringr","ggplot2","tidyr","purrr","sandwich","rlang","tibble")
 for(p in pkgs) if(!requireNamespace(p, quietly = TRUE)) install.packages(p)
 suppressPackageStartupMessages({
   library(plm); library(readr); library(dplyr); library(stringr)
-  library(broom); library(ggplot2); library(tidyr); library(purrr)
+  library(ggplot2); library(tidyr); library(purrr); library(sandwich)
+  library(rlang); library(tibble)
 })
-lag <- plm::lag  # ensure plm::lag in formulas
+lag <- plm::lag  # be explicit
 
-# ===== IO =====
+## ===== IO =====
 INPUTS <- c(
   master       = "Euro_B_stability_master.csv",
   base         = "master_base.csv",
   drop_imputed = "master_drop_imputed.csv",
   real_rate    = "master_real_rate.csv"
 )
-ALL_DVS   <- c("npl_ratio_filled","log_bank_z_score","capital_adequacy_ratio_filled")
-ALL_CTRL  <- c("gdp_growth","unemployment_rate","inflation","real_rate")
-TIME_STRATS <- c("full","bin2","trend")  # try in this order
+ALL_DVS  <- c("npl_ratio_filled","log_bank_z_score","capital_adequacy_ratio_filled")
+CGR_LAGS <- c(1, 2)  # Baseline CG1; CG2 kept as robustness
 
+## ===== Output dirs =====
 dir.create("out_models", showWarnings = FALSE, recursive = TRUE)
 dir.create("out_tex",     showWarnings = FALSE, recursive = TRUE)
 dir.create("out_figs",    showWarnings = FALSE, recursive = TRUE)
 
-# ===== Helpers =====
-stop_clean <- function(msg) stop(msg, call. = FALSE)
+## (Optional) Clear stale outputs
+CLEAR_OLD_OUTPUTS <- TRUE
+if (CLEAR_OLD_OUTPUTS) {
+  old_models <- list.files("out_models", pattern="^(fe_results_.*\\.(csv|tex)|coef_signs_.*\\.csv|fe_diag.*\\.csv)$", full.names=TRUE)
+  old_tex    <- list.files("out_tex",     pattern="^(fe_results_.*\\.tex|coef_signs_.*\\.tex|fe_diag.*\\.tex)$", full.names=TRUE)
+  old_figs   <- list.files("out_figs",    pattern="^FE_coeffs_.*\\.png$", full.names=TRUE)
+  unlink(c(old_models, old_tex, old_figs), force = TRUE)
+}
 
+## ===== Helpers =====
+stop_clean <- function(msg) stop(msg, call. = FALSE)
+escape_tex <- function(x){
+  x <- gsub("\\\\","\\\\textbackslash{}",x,perl=TRUE)
+  gsub("_","\\\\_",x,fixed=TRUE)
+}
 read_panel <- function(path){
   if(!file.exists(path)) stop_clean(paste0("File not found: ", path))
   df <- readr::read_csv(path, show_col_types = FALSE, progress = FALSE)
@@ -39,13 +52,16 @@ read_panel <- function(path){
   df
 }
 
-# Standardize names / construct log z-score if needed
+# Standardize names; safely construct log z-score; ALWAYS build real_rate_cs when possible
 standardize_vars <- function(df){
   nm <- names(df)
+  
   if(!"npl_ratio_filled" %in% nm && "npl_ratio" %in% nm)
     df <- dplyr::rename(df, npl_ratio_filled = npl_ratio)
+  
   if(!"capital_adequacy_ratio_filled" %in% nm && "capital_adequacy_ratio" %in% nm)
     df <- dplyr::rename(df, capital_adequacy_ratio_filled = capital_adequacy_ratio)
+  
   if(!"log_bank_z_score" %in% nm){
     lvl_cands <- c("bank_z_score","z_score","zscore","banks_z","bank_z")
     lvl <- intersect(lvl_cands, nm)
@@ -55,223 +71,135 @@ standardize_vars <- function(df){
       df$log_bank_z_score <- log(v)
     }
   }
-  if(!"unemployment_rate" %in% nm){
-    alt <- intersect(c("unemployment","unemp_rate","urate"), nm)
-    if(length(alt)) df <- dplyr::rename(df, unemployment_rate = .data[[alt[1]]])
+  
+  syn <- function(target, alts){
+    if(!target %in% names(df)){
+      hit <- intersect(alts, names(df))
+      if(length(hit)) df <- dplyr::rename(df, !!target := !!rlang::sym(hit[1]))
+    }
+    df
   }
-  if(!"real_rate" %in% nm){
-    alt <- intersect(c("real_interest_rate","rir","real_r"), nm)
-    if(length(alt)) df <- dplyr::rename(df, real_rate = .data[[alt[1]]])
+  df <- syn("unemployment_rate", c("unemployment","unemp_rate","urate"))
+  df <- syn("real_rate",         c("real_interest_rate","rir","real_r","realrate"))
+  df <- syn("gdp_growth",        c("gdp_growth_rate","real_gdp_growth","gdp_g","rgdp_growth"))
+  df <- syn("inflation",         c("inflation_rate","cpi_inflation","hicp"))
+  df <- syn("policy_rate",       c("policy","mpr","refi_rate","main_refinancing_rate","mro_rate"))
+  df <- syn("credit_to_gdp_gap", c("credit_gap","bis_gap","credit_to_gdp","credit_gap_bis"))
+  df <- syn("credit_growth",     c("credit_g","dlog_credit","credit_gr","credit_growth_rate"))
+  
+  # Fallback real rate if missing and inputs exist
+  if(!"real_rate" %in% names(df) && all(c("policy_rate","inflation") %in% names(df))){
+    df$real_rate <- df$policy_rate - df$inflation
   }
-  if(!"gdp_growth" %in% nm){
-    alt <- intersect(c("gdp_growth_rate","real_gdp_growth","gdp_g"), nm)
-    if(length(alt)) df <- dplyr::rename(df, gdp_growth = .data[[alt[1]]])
+  
+  # ALWAYS build cross-sectional real rate if policy_rate & inflation exist
+  if(all(c("policy_rate","inflation") %in% names(df))){
+    df$real_rate_cs <- df$policy_rate - df$inflation
   }
-  if(!"inflation" %in% nm){
-    alt <- intersect(c("inflation_rate","cpi_inflation","hicp"), nm)
-    if(length(alt)) df <- dplyr::rename(df, inflation = .data[[alt[1]]])
-  }
+  
   df
 }
 
-escape_tex <- function(x){
-  x <- gsub("\\\\","\\\\textbackslash{}",x,perl=TRUE)
-  gsub("_","\\\\_",x,fixed=TRUE)
-}
-
-# Instrument counter robust to plm versions
-count_instruments <- function(fit){
-  ni <- tryCatch({ W <- fit$W; if(!is.null(W)) as.integer(ncol(W)) else NA_integer_ }, error=function(e) NA_integer_)
-  if(!is.na(ni)) return(ni)
-  ni <- tryCatch({ s <- summary(fit, robust=TRUE); if(!is.null(s$k)) as.integer(s$k) else NA_integer_ }, error=function(e) NA_integer_)
-  if(!is.na(ni)) return(ni)
-  ni <- tryCatch({
-    sg <- sargan(fit, robust=TRUE)
-    df_overid <- if(!is.null(sg$parameter)) as.numeric(sg$parameter) else as.numeric(attr(sg,"parameter"))
-    k_params  <- length(coef(fit))
-    if(is.na(df_overid) || is.na(k_params)) NA_integer_ else as.integer(round(df_overid + k_params))
-  }, error=function(e) NA_integer_)
-  if(!is.na(ni)) return(ni)
-  ni <- tryCatch({ V <- vcov(fit); if(is.matrix(V) && nrow(V)==ncol(V) && nrow(V)>0) as.integer(nrow(V)) else NA_integer_ },
-                 error=function(e) NA_integer_)
-  ni
-}
-
-thin_country_filter <- function(df_model, dv, ctrls){
-  use <- unique(c("country","year", dv, ctrls))
-  present <- intersect(use, names(df_model))
-  d0 <- df_model[, present, drop = FALSE]
+# Keep countries with at least 2 usable years for a given DV + controls
+thin_country_filter_fe <- function(df, dv, base_ctrls, cg_lag = NA_integer_){
+  present_ctrls <- base_ctrls[base_ctrls %in% names(df)]
+  use <- unique(c("country","year", dv, present_ctrls))
+  if(!is.na(cg_lag) && "credit_growth" %in% names(df)) use <- unique(c(use, "credit_growth"))
+  
+  d0 <- df[, intersect(use, names(df)), drop = FALSE]
   d1 <- d0[stats::complete.cases(d0), , drop = FALSE]
-  agg <- d1 %>% group_by(country) %>% summarize(T = dplyr::n_distinct(year), .groups="drop")
-  keep <- agg %>% filter(T >= 4) %>% pull(country)
-  list(df = d1 %>% filter(country %in% keep),
+  
+  agg <- d1 %>% dplyr::group_by(country) %>% dplyr::summarize(T = dplyr::n_distinct(year), .groups="drop")
+  keep <- agg %>% dplyr::filter(T >= 2) %>% dplyr::pull(country)
+  
+  list(df = d1 %>% dplyr::filter(country %in% keep),
        dropped = setdiff(unique(d1$country), keep))
 }
 
-# Time IV strategy (returns both a description and a key)
-build_time_iv <- function(df_sub, strategy){
-  yr <- df_sub$year
-  if(strategy == "full"){
-    df_sub$time_iv <- factor(yr)
-    iv_cols <- nlevels(df_sub$time_iv) - 1L
-    return(list(df=df_sub, iv="time_iv", iv_cols=iv_cols, desc="factor(year)", key="full"))
-  } else if(strategy == "bin2"){
-    br <- seq(min(yr, na.rm=TRUE), max(yr, na.rm=TRUE)+2, by=2)
-    df_sub$time_iv <- cut(yr, breaks=br, right=FALSE, include.lowest=TRUE)
-    iv_cols <- nlevels(df_sub$time_iv) - 1L
-    return(list(df=df_sub, iv="time_iv", iv_cols=iv_cols, desc="2-year bins", key="bin2"))
-  } else {
-    df_sub$time_trend <- as.numeric(scale(yr))
-    return(list(df=df_sub, iv="time_trend", iv_cols=1L, desc="linear trend", key="trend"))
-  }
-}
-
-# Handy extractor for Hansen pieces (stat, df, p)
-get_hansen_triplet <- function(fit){
-  h <- tryCatch(sargan(fit, robust=TRUE), error=function(e) NULL)
-  if(is.null(h)) return(c(stat=NA_real_, df=NA_real_, p=NA_real_))
-  stat <- suppressWarnings(as.numeric(h$statistic))
-  df   <- if(!is.null(h$parameter)) suppressWarnings(as.numeric(h$parameter)) else suppressWarnings(as.numeric(attr(h,"parameter")))
-  p    <- suppressWarnings(as.numeric(h$p.value))
-  c(stat=stat, df=df, p=p)
-}
-
-attempt_pgmm <- function(df_model, panel, dv, L, U, tf, ctrls_available, time_strategy){
-  ctrls <- intersect(ctrls_available, names(df_model))
-  filt <- thin_country_filter(df_model, dv, ctrls)
-  df_sub <- filt$df; dropped <- filt$dropped
-  if(nrow(df_sub)==0){
-    return(list(ok=FALSE, status=sprintf("no usable rows after NA drop; dropped_thin_countries=%d", length(dropped)),
-                diag=NULL, fit=NULL))
+# Compose controls (prefer real_rate_cs ⇒ drop inflation to avoid collinearity with year FE)
+# ---- REPLACE compose_ctrls() WITH THIS VERSION ----
+compose_ctrls <- function(df, cg_lag = NA_integer_, force_rate = c("auto","real","policy")){
+  force_rate <- match.arg(force_rate)
+  
+  # macro block: start with GDP, unemployment, inflation
+  ctrl <- character(0)
+  for(v in c("gdp_growth","unemployment_rate","inflation")){
+    if(v %in% names(df)) ctrl <- c(ctrl, v)
   }
   
-  tb <- build_time_iv(df_sub, time_strategy)
-  df_sub <- tb$df; time_iv <- tb$iv; time_iv_cols <- tb$iv_cols; time_desc <- tb$desc; time_key <- tb$key
+  rate_used <- NA_character_
+  add <- function(v){ ctrl <<- c(ctrl, v); rate_used <<- v }
   
-  pdat <- pdata.frame(df_sub, index=c("country","year"))
+  if (force_rate == "policy") {
+    if ("policy_rate" %in% names(df)) add("policy_rate")
+  } else if (force_rate == "real") {
+    if ("real_rate" %in% names(df)) add("real_rate")
+    else if ("real_rate_cs" %in% names(df)) add("real_rate_cs")
+    else if ("policy_rate" %in% names(df)) add("policy_rate")
+  } else { # auto
+    if ("real_rate" %in% names(df)) add("real_rate")
+    else if ("real_rate_cs" %in% names(df)) add("real_rate_cs")
+    else if ("policy_rate" %in% names(df)) add("policy_rate")
+  }
   
-  rhs_ctrl <- if(length(ctrls)) paste(ctrls, collapse=" + ") else NULL
-  rhs <- paste0("lag(", dv, ", 1)",
-                if(!is.null(rhs_ctrl)) paste0(" + ", rhs_ctrl) else "",
-                " + ", time_iv)  # time effects IN the regression
+  # >>> PATCH: avoid collinearity with year FE when using a "real" rate
+  if (!is.na(rate_used) && rate_used %in% c("real_rate","real_rate_cs")) {
+    ctrl <- setdiff(ctrl, "inflation")
+  }
+  # <<<
   
-  # LDV instruments (collapsed) as before
-  inst_gmm <- sprintf("lag(%s, %d:%d)", dv, L, U)
+  if ("credit_to_gdp_gap" %in% names(df)) ctrl <- c(ctrl, "credit_to_gdp_gap")
   
-  # ===== CHANGED: macro controls are PREDETERMINED → use lagged (2:3) instruments =====
-  inst_pre <- if (length(ctrls)) paste(sprintf("lag(%s, 2:3)", ctrls), collapse=" + ") else NULL
+  cg_term <- NA_character_
+  if(!is.na(cg_lag) && "credit_growth" %in% names(df)){
+    cg_term <- sprintf("lag(credit_growth,%d)", cg_lag)
+  }
   
-  # Keep time effects in the IV block (as in the thesis)
-  inst_iv  <- paste(c(inst_pre, time_iv), collapse=" + ")
-  
-  fml_str  <- paste(dv, "~", rhs, "|", paste(inst_gmm, inst_iv, sep=" + "))
-  fml <- as.formula(fml_str, env = environment())
-  
-  fit <- tryCatch(pgmm(formula=fml, data=pdat, effect="individual",
-                       model="twosteps", transformation=tf, collapse=TRUE),
+  list(ctrl = unique(ctrl), rate_used = rate_used, cg_term = cg_term)
+}
+
+# Fit FE and compute SEs: clustered by country & Driscoll–Kraay (explicit maxlag)
+fit_fe_dual_ses <- function(pdat, fml){
+  fit <- tryCatch(plm(fml, data=pdat, model="within", effect="twoways"),
                   error=function(e) e)
   if(inherits(fit,"error")){
-    status <- sprintf("error(L%d:%d,%s,%s): %s", L, U, tf, time_strategy, conditionMessage(fit))
-    return(list(ok=FALSE, status=status, diag=NULL, fit=NULL,
-                dropped=dropped, L=L, U=U, tf=tf, ctrls_used=ctrls, time_fe=time_desc, time_strategy=time_key))
+    return(list(ok=FALSE, status=paste("fit_error:", conditionMessage(fit))))
   }
   
-  s        <- summary(fit, robust=TRUE)
-  ar1      <- tryCatch(mtest(fit, order=1)$p.value, error=function(e) NA_real_)
-  ar2      <- tryCatch(mtest(fit, order=2)$p.value, error=function(e) NA_real_)
-  get_hansen_triplet <- function(fit){
-    h <- tryCatch(sargan(fit, robust=TRUE), error=function(e) NULL)
-    if(is.null(h)) return(c(stat=NA_real_, df=NA_real_, p=NA_real_))
-    c(stat=suppressWarnings(as.numeric(h$statistic)),
-      df  =suppressWarnings(as.numeric(if(!is.null(h$parameter)) h$parameter else attr(h,"parameter"))),
-      p   =suppressWarnings(as.numeric(h$p.value)))
-  }
-  hans_trip <- get_hansen_triplet(fit)
-  hansen    <- hans_trip[["p"]]
-  hans_stat <- hans_trip[["stat"]]
-  hans_df   <- hans_trip[["df"]]
+  # Clustered by country (baseline)
+  Vc <- tryCatch(plm::vcovHC(fit, type="HC1", cluster="group"), error=function(e) NULL)
+  if(is.null(Vc)) Vc <- vcov(fit)
+  se_c <- sqrt(diag(Vc))
   
-  n_cty   <- length(unique(index(pdat)[[1]]))
-  count_instruments <- function(fit){
-    ni <- tryCatch({ W <- fit$W; if(!is.null(W)) as.integer(ncol(W)) else NA_integer_ }, error=function(e) NA_integer_)
-    if(!is.na(ni)) return(ni)
-    ni <- tryCatch({ s <- summary(fit, robust=TRUE); if(!is.null(s$k)) as.integer(s$k) else NA_integer_ }, error=function(e) NA_integer_)
-    if(!is.na(ni)) return(ni)
-    ni <- tryCatch({
-      sg <- sargan(fit, robust=TRUE)
-      df_overid <- if(!is.null(sg$parameter)) as.numeric(sg$parameter) else as.numeric(attr(sg,"parameter"))
-      k_params  <- length(coef(fit))
-      if(is.na(df_overid) || is.na(k_params)) NA_integer_ else as.integer(round(df_overid + k_params))
-    }, error=function(e) NA_integer_)
-    if(!is.na(ni)) return(ni)
-    ni <- tryCatch({ V <- vcov(fit); if(is.matrix(V) && nrow(V)==ncol(V) && nrow(V)>0) as.integer(nrow(V)) else NA_integer_ },
-                   error=function(e) NA_integer_)
-    ni
-  }
-  n_inst <- tryCatch(count_instruments(fit), error=function(e) NA_integer_)
-  if(is.na(n_inst)){ # conservative fallback
-    gmm_cols <- (U - L + 1) * ifelse(tf == "ld", 2, 1)
-    n_inst <- as.integer(length(ctrls) + time_iv_cols + gmm_cols)
-  }
-  N_obs <- tryCatch(nobs(fit), error=function(e) NA_integer_)
+  # Driscoll–Kraay (robustness) with explicit maxlag
+  years_unique <- tryCatch(length(unique(index(pdat)[[2]])), error=function(e) NA_integer_)
+  maxlag <- if(is.na(years_unique)) 1L else max(1L, floor(4 * (years_unique^(2/9))))
+  Vd <- tryCatch(plm::vcovSCC(fit, type="HC1", maxlag = maxlag), error=function(e) NULL)
+  if(is.null(Vd)) Vd <- vcov(fit)
+  se_d <- sqrt(diag(Vd))
   
-  ar2_ok  <- (!is.na(ar2) && ar2 > 0.10)
-  hans_ok <- (!is.na(hansen) && hansen >= 0.10 && hansen <= 0.90)
-  
-  # ===== CHANGED: panel-agnostic instrument cap =====
-  inst_ok <- (is.na(n_inst) || n_inst < n_cty)
-  
-  pass <- (ar2_ok && hans_ok && inst_ok)  # AR(1) can be significant; not a guardrail
-  
-  coef_tab <- as.data.frame(s$coefficients)
-  if(nrow(coef_tab)){
-    names(coef_tab) <- c("beta","se","t","p"); coef_tab$term <- rownames(s$coefficients)
-    coef_tab <- coef_tab %>% dplyr::select(term,beta,se,t,p)
-  } else {
-    coef_tab <- tibble::tibble(term=character(), beta=double(), se=double(), t=double(), p=double())
-  }
-  
-  status <- if(pass){
-    sprintf("ok; dropped_thin_countries=%d", length(dropped))
-  } else {
-    sprintf("guardrail_fail(L%d:%d,%s,%s): AR2=%.3f, Hansen=%.3f, n_inst=%s, n_cty=%d; dropped_thin_countries=%d",
-            L, U, tf, time_strategy,
-            ifelse(is.na(ar2), NA_real_, ar2),
-            ifelse(is.na(hansen), NA_real_, hansen),
-            ifelse(is.na(n_inst), "NA", as.character(n_inst)), n_cty, length(dropped))
-  }
-  
-  diag <- data.frame(
-    panel=panel, dv=dv, N=N_obs, countries=n_cty,
-    n_instruments=n_inst, AR1_p=ar1, AR2_p=ar2, Hansen_p=hansen,
-    Hansen_stat=hans_stat, Hansen_df=hans_df,
-    DiffH_stat=NA_real_, DiffH_df=NA_real_, DiffH_p=NA_real_,  # filled later if system chosen
-    passes=pass, status=status, transformation=tf, lags_used=sprintf("%d:%d",L,U),
-    controls_used=paste(ctrls, collapse="+"), time_fe=time_desc, time_strategy=time_key,
-    stringsAsFactors=FALSE
-  )
-  
-  list(ok=pass, status=status, diag=diag, fit=fit,
-       coef_tab=coef_tab, dropped=dropped, L=L, U=U, tf=tf,
-       ctrls_used=ctrls, time_fe=time_desc, time_strategy=time_key)
+  list(ok=TRUE, fit=fit, se_cluster=se_c, se_dk=se_d)
 }
 
-write_outputs_if_pass <- function(res, panel, dv){
-  if(!isTRUE(res$ok)) return(invisible(NULL))
-  # e.g. "trend_L2U2_ld"
-  spec_tag <- sprintf("%s_L%dU%d_%s", res$time_strategy, res$L, res$U, res$tf)
-  
-  # CSV + TeX filenames carry the spec tag
-  readr::write_csv(
-    res$coef_tab,
-    file.path("out_models", sprintf("sysgmm_results_%s_%s_%s.csv", panel, dv, spec_tag))
-  )
-  
-  tex <- file.path("out_tex", sprintf("sysgmm_results_%s_%s_%s.tex", panel, dv, spec_tag))
+coef_table_from <- function(beta, se){
+  common <- intersect(names(beta), names(se))
+  b <- beta[common]; s <- se[common]
+  tval <- b / s
+  pval <- 2 * pnorm(abs(tval), lower.tail = FALSE)
+  data.frame(term=names(b), beta=as.numeric(b), se=as.numeric(s),
+             t=as.numeric(tval), p=as.numeric(pval), check.names=FALSE)
+}
+
+write_coef_outputs <- function(tab, panel, dv, spec_tag, se_tag){
+  # CSV
+  readr::write_csv(tab, file.path("out_models", sprintf("fe_results_%s_%s_%s_%s.csv",
+                                                        panel, dv, spec_tag, se_tag)))
+  # TeX
+  tex <- file.path("out_tex", sprintf("fe_results_%s_%s_%s_%s.tex", panel, dv, spec_tag, se_tag))
   cat("\\scriptsize\n\\setlength{\\tabcolsep}{4.5pt}\n\\setlength\\LTleft{0pt}\n\\setlength\\LTright{0pt}\n",
       "\\begin{longtable}{lrrrr}\n\\hline\nTerm & $\\beta$ & SE & $t$ & $p$\\\\\\hline\n", file=tex)
-  if(nrow(res$coef_tab)){
-    apply(res$coef_tab, 1, function(r){
+  if(nrow(tab)){
+    apply(tab, 1, function(r){
       cat(sprintf("%s & %.6f & %.6f & %.3f & %.3f\\\\\n",
                   escape_tex(as.character(r[["term"]])),
                   as.numeric(r[["beta"]]),
@@ -282,184 +210,485 @@ write_outputs_if_pass <- function(res, panel, dv){
     })
   }
   cat("\\hline\n\\end{longtable}\n", file=tex, append=TRUE)
-}
-
-plot_and_save <- function(diag_df, panel){
-  if(!nrow(diag_df)) return(invisible(NULL))
-  dd  <- diag_df %>% dplyr::filter(!is.na(AR2_p) & !is.na(Hansen_p))
-  dd1 <- diag_df %>% dplyr::filter(!is.na(AR1_p))
   
-  p0 <- ggplot(dd1, aes(x=dv, y=AR1_p)) + geom_col(alpha=.7) +
-    geom_hline(yintercept=.10, linetype="dashed") +
-    theme_minimal() + labs(title=paste("AR(1) p-values —", panel), x="DV", y="p-value") +
-    theme(axis.text.x = element_text(angle=45, hjust=1))
-  ggsave(filename=file.path("out_figs", sprintf("%s_AR1.png", panel)), plot=p0, width=7, height=5, dpi=300)
-  
-  p1 <- ggplot(dd, aes(x=dv, y=AR2_p)) + geom_col(alpha=.7) +
-    geom_hline(yintercept=.10, linetype="dashed") +
-    theme_minimal() + labs(title=paste("AR(2) p-values —", panel), x="DV", y="p-value") +
-    theme(axis.text.x = element_text(angle=45, hjust=1))
-  ggsave(filename=file.path("out_figs", sprintf("%s_AR2.png", panel)), plot=p1, width=7, height=5, dpi=300)
-  
-  p2 <- ggplot(dd, aes(x=dv, y=Hansen_p)) + geom_col(alpha=.7) +
-    geom_hline(yintercept=.10, linetype="dashed") + geom_hline(yintercept=.90, linetype="dotted") +
-    theme_minimal() + labs(title=paste("Hansen p-values —", panel), x="DV", y="p-value") +
-    theme(axis.text.x = element_text(angle=45, hjust=1))
-  ggsave(filename=file.path("out_figs", sprintf("%s_Hansen.png", panel)), plot=p2, width=7, height=5, dpi=300)
-}
-
-# Compute DIH for extra System moments: needs a matched "d" spec (same lags & same time_strategy)
-compute_diff_hansen <- function(res_sys, res_diff){
-  trip_sys  <- get_hansen_triplet(res_sys$fit)
-  trip_diff <- get_hansen_triplet(res_diff$fit)
-  if(any(is.na(c(trip_sys["stat"],trip_sys["df"],trip_diff["stat"],trip_diff["df"])))) {
-    return(c(DiffH_stat=NA_real_, DiffH_df=NA_real_, DiffH_p=NA_real_))
+  # Plot
+  if(nrow(tab)){
+    p <- ggplot(tab, aes(x=term, y=beta, ymin=beta-se, ymax=beta+se)) +
+      geom_pointrange() + geom_hline(yintercept=0, linetype="dashed") +
+      theme_minimal() +
+      labs(title=paste("FE:", panel, dv, "—", spec_tag, "/", se_tag),
+           x=NULL, y="β (±1 SE)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    ggsave(filename=file.path("out_figs",
+                              sprintf("FE_coeffs_%s_%s_%s_%s.png", panel, dv, spec_tag, se_tag)),
+           plot=p, width=7, height=5, dpi=300)
   }
-  dstat <- as.numeric(trip_sys["stat"] - trip_diff["stat"])
-  ddf   <- as.numeric(trip_sys["df"]   - trip_diff["df"])
-  pval  <- if(is.finite(dstat) && is.finite(ddf) && ddf > 0) pchisq(dstat, df=ddf, lower.tail=FALSE) else NA_real_
-  c(DiffH_stat=dstat, DiffH_df=ddf, DiffH_p=pval)
 }
 
-run_panel <- function(path, panel){
-  message(">>> Reading panel: ", panel, " (", path, ")")
+## ===== ONE FE ATTEMPT (no LDV in FE baseline) =====
+fe_attempt <- function(df_model, panel, dv, cg_lag = NA_integer_, force_rate = c("real","policy","auto")){
+  force_rate <- match.arg(force_rate)
+  
+  cfg <- compose_ctrls(df_model, cg_lag=cg_lag, force_rate=force_rate)
+  ctrls     <- cfg$ctrl
+  cg_term   <- cfg$cg_term
+  rate_used <- cfg$rate_used
+  
+  filt <- thin_country_filter_fe(df_model, dv, base_ctrls=ctrls, cg_lag=cg_lag)
+  df_sub <- filt$df; dropped <- filt$dropped
+  if(nrow(df_sub) == 0){
+    return(list(ok=FALSE, status=sprintf("no usable rows; dropped_countries=%d", length(dropped))))
+  }
+  
+  pdat <- pdata.frame(df_sub, index=c("country","year"))
+  
+  rhs_parts <- character(0)
+  if(length(ctrls)) rhs_parts <- c(rhs_parts, ctrls)
+  if(!is.na(cg_term)) rhs_parts <- c(rhs_parts, cg_term)
+  rhs <- paste(rhs_parts, collapse=" + ")
+  fml <- as.formula(paste0(dv, " ~ ", rhs), env = environment())
+  
+  fitres <- fit_fe_dual_ses(pdat, fml)
+  if(!isTRUE(fitres$ok)) return(list(ok=FALSE, status=fitres$status))
+  
+  fit  <- fitres$fit
+  beta <- tryCatch(coef(fit), error=function(e) NULL)
+  if(is.null(beta)) return(list(ok=FALSE, status="coef_extract_failed"))
+  
+  N_obs   <- tryCatch(nobs(fit), error=function(e) NA_integer_)
+  n_ctry  <- length(unique(df_sub$country))
+  n_years <- length(unique(df_sub$year))
+  pooled  <- tryCatch(plm(fml, data=pdat, model="pooling"), error=function(e) NULL)
+  pF      <- tryCatch(plm::pFtest(fit, pooled)$p.value, error=function(e) NA_real_)
+  random  <- tryCatch(plm(fml, data=pdat, model="random"), error=function(e) NULL)
+  haus    <- tryCatch(plm::phtest(fit, random)$p.value, error=function(e) NA_real_)
+  fe_pref <- (!is.na(pF) && pF < 0.05) && (!is.na(haus) && haus < 0.05)
+  
+  tab_cluster <- coef_table_from(beta, fitres$se_cluster)
+  tab_dk      <- coef_table_from(beta, fitres$se_dk)
+  
+  spec_tag <- paste0("CG", ifelse(is.na(cg_lag),"0",cg_lag), "_", ifelse(is.na(rate_used),"noRate",rate_used))
+  
+  write_coef_outputs(tab_cluster, panel, dv, spec_tag, "CLUSTER")
+  write_coef_outputs(tab_dk,      panel, dv, spec_tag, "DK")
+  
+  diag_row <- function(se_type){
+    data.frame(
+      panel=panel, dv=dv, N=N_obs, countries=n_ctry, years=n_years,
+      se_type=se_type, FE_vs_pooled_p=pF, Hausman_p=haus, FE_preferred=fe_pref,
+      rate_used=ifelse(is.na(rate_used),"--",rate_used),
+      cg_lag=ifelse(is.na(cg_lag),"--",as.character(cg_lag)),
+      controls_used=paste(c(ctrls, if(!is.na(cg_term)) cg_term), collapse="+"),
+      dropped_countries=length(dropped),
+      status="ok", stringsAsFactors=FALSE
+    )
+  }
+  
+  list(ok=TRUE, diag=rbind(diag_row("CR1-group"), diag_row("DK(HC1)")))
+}
+
+run_panel_fe <- function(path, panel){
+  message(">>> FE: reading panel: ", panel, " (", path, ")")
   df <- read_panel(path) %>% standardize_vars()
   
-  dvs_present   <- intersect(ALL_DVS,  names(df))
-  ctrls_present <- intersect(ALL_CTRL, names(df))
-  
+  dvs_present <- intersect(ALL_DVS, names(df))
   if(length(dvs_present)==0){
     message("No target DVs present in ", panel, " — skipping.")
     return(tibble::tibble(
       panel=panel, dv=ALL_DVS, N=NA_integer_, countries=length(unique(df$country)),
-      n_instruments=NA_integer_, AR1_p=NA_real_, AR2_p=NA_real_, Hansen_p=NA_real_,
-      Hansen_stat=NA_real_, Hansen_df=NA_real_,
-      DiffH_stat=NA_real_, DiffH_df=NA_real_, DiffH_p=NA_real_,
-      passes=FALSE, status="dv_missing", transformation=NA_character_, lags_used=NA_character_,
-      controls_used=NA_character_, time_fe=NA_character_, time_strategy=NA_character_
+      years=NA_integer_, se_type=NA_character_,
+      FE_vs_pooled_p=NA_real_, Hausman_p=NA_real_, FE_preferred=FALSE,
+      rate_used=NA_character_, cg_lag=NA_character_,
+      controls_used=NA_character_, dropped_countries=NA_integer_, status="dv_missing"
     ))
-  }
-  if(length(ctrls_present)==0){
-    message("Note (", panel, "): no listed controls found; models = lag(DV,1) + time.")
-  } else {
-    message("Controls used (", panel, "): ", paste(ctrls_present, collapse=", "))
   }
   
   diag_rows <- list()
   
-  # mark any missing DVs explicitly
-  for(dv in setdiff(ALL_DVS, dvs_present)){
-    diag_rows[[length(diag_rows)+1]] <- data.frame(
-      panel=panel, dv=dv, N=NA_integer_, countries=length(unique(df$country)),
-      n_instruments=NA_integer_, AR1_p=NA_real_, AR2_p=NA_real_, Hansen_p=NA_real_,
-      Hansen_stat=NA_real_, Hansen_df=NA_real_,
-      DiffH_stat=NA_real_, DiffH_df=NA_real_, DiffH_p=NA_real_,
-      passes=FALSE, status="dv_missing", transformation=NA_character_,
-      lags_used=NA_character_, controls_used=NA_character_, time_fe=NA_character_, time_strategy=NA_character_,
-      stringsAsFactors=FALSE
-    )
-  }
-  
   for(dv in dvs_present){
-    success <- FALSE
-    attempt_log <- character(0)
-    chosen_res <- NULL
-    
-    # try time-IV strategies in order
-    for(time_strategy in TIME_STRATS){
-      # try baseline/robust lag windows
-      for(spec in list(
-        list(tf="ld", L=2, U=2),
-        list(tf="ld", L=2, U=3),
-        list(tf="ld", L=3, U=4),
-        list(tf="d",  L=2, U=3)
-      )){
-        a <- attempt_pgmm(df, panel, dv, L=spec$L, U=spec$U, tf=spec$tf,
-                          ctrls_available=ctrls_present, time_strategy=time_strategy)
-        attempt_log <- c(attempt_log, a$status)
-        if(isTRUE(a$ok)){
-          chosen_res <- a
-          write_outputs_if_pass(a, panel, dv)
-          success <- TRUE
-          break
+    rate_choice <- "auto"
+    if("credit_growth" %in% names(df)){
+      for(k in CGR_LAGS){
+        res <- fe_attempt(df, panel, dv, cg_lag=k, force_rate=rate_choice)
+        if(isTRUE(res$ok)) {
+          diag_rows[[length(diag_rows)+1]] <- res$diag
+        } else {
+          diag_rows[[length(diag_rows)+1]] <- data.frame(
+            panel=panel, dv=dv, N=NA_integer_, countries=length(unique(df$country)),
+            years=NA_integer_, se_type=NA_character_,
+            FE_vs_pooled_p=NA_real_, Hausman_p=NA_real_, FE_preferred=FALSE,
+            rate_used=rate_choice, cg_lag=as.character(k),
+            controls_used=NA_character_, dropped_countries=NA_integer_,
+            status=res$status, stringsAsFactors=FALSE
+          )
         }
-      }
-      if(success) break
-    }
-    
-    if(success){
-      # ===== NEW: Difference-in-Hansen (System vs Difference), same lags & same time strategy =====
-      dih <- c(DiffH_stat=NA_real_, DiffH_df=NA_real_, DiffH_p=NA_real_)
-      if(identical(chosen_res$tf, "ld")){  # only meaningful for System GMM
-        L <- as.integer(strsplit(chosen_res$diag$lags_used,":")[[1]][1])
-        U <- as.integer(strsplit(chosen_res$diag$lags_used,":")[[1]][2])
-        res_diff <- attempt_pgmm(df, panel, dv, L=L, U=U, tf="d",
-                                 ctrls_available=ctrls_present,
-                                 time_strategy=chosen_res$time_strategy)
-        if(!inherits(res_diff$fit, "error") && !is.null(res_diff$fit)) {
-          # use your helper to compute DIH:
-          dih <- compute_diff_hansen(chosen_res, res_diff)
-        }
-      }
-      
-      # add diagnostics row (with DIH fields filled)
-      drow <- chosen_res$diag
-      drow$DiffH_stat <- dih[["DiffH_stat"]]
-      drow$DiffH_df   <- dih[["DiffH_df"]]
-      drow$DiffH_p    <- dih[["DiffH_p"]]
-      diag_rows[[length(diag_rows)+1]] <- drow
-      
-      # coefficient plot (unchanged)
-      coefs <- chosen_res$coef_tab
-      if(nrow(coefs)){
-        p <- ggplot(coefs, aes(x=term, y=beta, ymin=beta-se, ymax=beta+se)) +
-          geom_pointrange() + geom_hline(yintercept=0, linetype="dashed") +
-          theme_minimal() + labs(title=paste(panel, dv, "— Coefficients"), x=NULL, y="β (±1 SE)") +
-          theme(axis.text.x = element_text(angle=45, hjust=1))
-        ggsave(filename=file.path("out_figs", sprintf("%s_coeffs_%s.png", panel, dv)), plot=p,
-               width=7, height=5, dpi=300)
       }
     } else {
-      # everything failed for this DV
-      diag_rows[[length(diag_rows)+1]] <- data.frame(
-        panel=panel, dv=dv, N=NA_integer_, countries=length(unique(df$country)),
-        n_instruments=NA_integer_, AR1_p=NA_real_, AR2_p=NA_real_, Hansen_p=NA_real_,
-        Hansen_stat=NA_real_, Hansen_df=NA_real_,
-        DiffH_stat=NA_real_, DiffH_df=NA_real_, DiffH_p=NA_real_,
-        passes=FALSE, status=paste0("all_failed: ", paste(attempt_log, collapse=" | ")),
-        transformation=NA_character_, lags_used=NA_character_,
-        controls_used=paste(ctrls_present, collapse="+"),
-        time_fe="all_strategies_failed", time_strategy=NA_character_, stringsAsFactors=FALSE
-      )
+      res <- fe_attempt(df, panel, dv, cg_lag=NA_integer_, force_rate=rate_choice)
+      if(isTRUE(res$ok)) {
+        diag_rows[[length(diag_rows)+1]] <- res$diag
+      } else {
+        diag_rows[[length(diag_rows)+1]] <- data.frame(
+          panel=panel, dv=dv, N=NA_integer_, countries=length(unique(df$country)),
+          years=NA_integer_, se_type=NA_character_,
+          FE_vs_pooled_p=NA_real_, Hausman_p=NA_real_, FE_preferred=FALSE,
+          rate_used=rate_choice, cg_lag="--",
+          controls_used=NA_character_, dropped_countries=NA_integer_,
+          status=res$status, stringsAsFactors=FALSE
+        )
+      }
     }
   }
   
-  diag_df <- dplyr::bind_rows(diag_rows)
-  plot_and_save(diag_df, panel)
-  diag_df
+  dplyr::bind_rows(diag_rows)
 }
 
-# ===== Run all panels that exist =====
+## ===== Run all panels that exist =====
 existing <- INPUTS[file.exists(INPUTS)]
 if(length(existing)==0) stop_clean("None of the expected input CSVs are in the working directory.")
-all_diags <- purrr::imap_dfr(existing, run_panel)
+fe_diags <- purrr::imap_dfr(existing, run_panel_fe)
 
-# Combined diagnostics summary
-readr::write_csv(all_diags, file.path("out_models","gmm_diagnostics_summary_all.csv"))
-message("\n=== Combined GMM Diagnostics Summary ===")
-print(all_diags %>% dplyr::select(panel, dv, N, countries, n_instruments,
-                                  AR1_p, AR2_p, Hansen_p, DiffH_p,
-                                  transformation, lags_used, controls_used, time_fe, status))
+## ===== Save & print diagnostic summary =====
+readr::write_csv(fe_diags, file.path("out_models","fe_diagnostics_summary_all.csv"))
+message("\n=== FE Diagnostics Summary ===")
+print(fe_diags %>%
+        dplyr::select(panel, dv, N, countries, years, se_type,
+                      FE_vs_pooled_p, Hausman_p, FE_preferred,
+                      rate_used, cg_lag, controls_used, dropped_countries, status))
 
-passed <- all_diags %>% dplyr::filter(passes)
-if(nrow(passed)>0){
-  message("\nPassed models:")
-  print(passed %>% dplyr::select(panel, dv, AR1_p, AR2_p, Hansen_p, DiffH_p, n_instruments,
-                                 transformation, lags_used, controls_used, time_fe))
-} else {
-  message("\nNo models passed guardrails.")
+## ===== Pretty LaTeX diagnostics summary table =====
+fmt_int <- function(x) ifelse(is.na(x), "--", formatC(as.integer(x), format="d"))
+fmt_p   <- function(x) ifelse(is.na(x), "--", formatC(as.numeric(x), digits=3, format="f"))
+fmt_txt <- function(x) ifelse(is.na(x) | x=="", "--", escape_tex(as.character(x)))
+tex_diag <- file.path("out_tex","fe_diagnostics_summary_all.tex")
+con <- file(tex_diag, "w")
+cat("\\scriptsize\n\\setlength{\\tabcolsep}{4.5pt}\n\\setlength\\LTleft{0pt}\n\\setlength\\LTright{0pt}\n",
+    "\\begin{longtable}{l l r r r l r r c c l r l}\n",
+    "\\caption{Two-way FE diagnostics across panels, DVs and specs}\\label{tab:fe_diags}\\\\\n",
+    "\\hline\n",
+    "Panel & DV & N & Ctries & Years & SEs & pF (FE vs pooled) & Hausman & FE pref & Rate & CG lag & Controls & Dropped\\\\\n",
+    "\\hline\n\\endfirsthead\n",
+    "\\hline\n",
+    "Panel & DV & N & Ctries & Years & SEs & pF (FE vs pooled) & Hausman & FE pref & Rate & CG lag & Controls & Dropped\\\\\n",
+    "\\hline\n\\endhead\n",
+    file = con)
+for (i in seq_len(nrow(fe_diags))) {
+  r <- fe_diags[i, ]
+  cat(sprintf("%s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s\\\\\n",
+              fmt_txt(r$panel),
+              fmt_txt(r$dv),
+              fmt_int(r$N),
+              fmt_int(r$countries),
+              fmt_int(r$years),
+              fmt_txt(r$se_type),
+              fmt_p(r$FE_vs_pooled_p),
+              fmt_p(r$Hausman_p),
+              ifelse(isTRUE(r$FE_preferred), "Yes", "No"),
+              fmt_txt(r$rate_used),
+              fmt_txt(r$cg_lag),
+              fmt_txt(r$controls_used),
+              fmt_int(r$dropped_countries)),
+      file = con)
+}
+cat("\\hline\n\\end{longtable}\n", file = con)
+close(con)
+message("Wrote: ", tex_diag)
+
+## ===== FE-only sign summary (prefer CLUSTER, CG1 only) =====
+star <- function(p) ifelse(is.na(p),"", ifelse(p<.01,"***", ifelse(p<.05,"**", ifelse(p<.10,"*",""))))
+fe_files_all <- list.files("out_models",
+                           pattern="^fe_results_(.+?)_(.+?)_(CG\\d+_.+?)_(CLUSTER|DK)\\.csv$",
+                           full.names = TRUE)
+fe_files <- fe_files_all[grepl("_CG1_", fe_files_all) | !grepl("_CG\\d+_", fe_files_all)]
+fe_tbl <- purrr::map_dfr(fe_files, function(f){
+  m <- stringr::str_match(basename(f), "^fe_results_(.+?)_(.+?)_(CG\\d+_.+?)_(CLUSTER|DK)\\.csv$")
+  panel <- m[2]; dv <- m[3]; spec <- m[4]; se_type <- m[5]
+  readr::read_csv(f, show_col_types = FALSE) %>%
+    dplyr::mutate(panel=panel, dv=dv, method=paste0("FE(",se_type,")"), spec=spec,
+                  sign=dplyr::case_when(beta > 0 ~ "+", beta < 0 ~ "−", TRUE ~ "0"),
+                  stars=star(p)) %>%
+    dplyr::select(panel, dv, method, spec, term, beta, se, p, stars, sign)
+})
+
+fe_tbl_pref <- fe_tbl %>%
+  dplyr::mutate(pref = ifelse(grepl("^FE\\(CLUSTER\\)", method), 1L, 2L)) %>%
+  dplyr::group_by(panel, dv, term) %>%
+  dplyr::arrange(pref, .by_group=TRUE) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-pref)
+
+key_terms <- c("gdp_growth","unemployment_rate","inflation","policy_rate","real_rate","real_rate_cs","credit_to_gdp_gap")
+sign_summary <- fe_tbl_pref %>%
+  dplyr::filter(term %in% key_terms) %>%
+  dplyr::arrange(panel, dv, method, term)
+
+out_sign_csv  <- file.path("out_models","coef_signs_summary_FE_only.csv")
+readr::write_csv(sign_summary, out_sign_csv)
+
+tex_signs <- file.path("out_tex","coef_signs_summary_FE_only.tex")
+cat("\\scriptsize\n\\setlength{\\tabcolsep}{4.5pt}\n\\setlength\\LTleft{0pt}\n\\setlength\\LTright{0pt}\n",
+    "\\begin{longtable}{l l l l c c r r r}\n\\hline\n",
+    "Panel & DV & Method & Term & Sign & Stars & $\\beta$ & SE & $p$ \\\\\\hline\n", file=tex_signs)
+apply(sign_summary, 1, function(r){
+  cat(sprintf("%s & %s & %s & %s & %s & %s & %.6f & %.6f & %.3f\\\\\n",
+              r[["panel"]], r[["dv"]], r[["method"]],
+              gsub("_","\\_", r[["term"]], fixed=TRUE),
+              r[["sign"]], r[["stars"]],
+              as.numeric(r[["beta"]]), as.numeric(r[["se"]]), as.numeric(r[["p"]])),
+      file=tex_signs, append=TRUE)
+})
+cat("\\hline\n\\end{longtable}\n", file=tex_signs, append=TRUE)
+message("Wrote: ", out_sign_csv, " and ", tex_signs)
+
+## ===== Diagnostics + representative FE(CLUSTER) signs per (panel,dv), CG1 baseline =====
+sgn  <- function(b) ifelse(is.na(b),"", ifelse(b>0,"+", ifelse(b<0,"−","0")))
+prefer_real <- function(files){
+  if(length(files) == 0) return(files)
+  fbase <- basename(files)
+  c(files[grepl("_real_rate", fbase)], files[!grepl("_real_rate", fbase)])
+}
+grab_rep_file <- function(panel, dv){
+  files_cl1 <- list.files("out_models",
+                          pattern=paste0("^fe_results_", panel, "_", dv, "_(CG1_.+?)_CLUSTER\\.csv$"),
+                          full.names = TRUE)
+  files_cl1 <- prefer_real(files_cl1)
+  if(length(files_cl1) > 0) return(files_cl1[1])
+  files_dk1 <- list.files("out_models",
+                          pattern=paste0("^fe_results_", panel, "_", dv, "_(CG1_.+?)_DK\\.csv$"),
+                          full.names = TRUE)
+  files_dk1 <- prefer_real(files_dk1)
+  if(length(files_dk1) > 0) return(files_dk1[1])
+  files_cl <- list.files("out_models",
+                         pattern=paste0("^fe_results_", panel, "_", dv, "_(CG\\d+_.+?)_CLUSTER\\.csv$"),
+                         full.names = TRUE)
+  if(length(files_cl) > 0){
+    df <- tibble(path = files_cl) %>%
+      dplyr::mutate(spec = stringr::str_match(basename(path), "_(CG\\d+_.+?)_CLUSTER\\.csv$")[,2],
+                    cgnum = as.integer(stringr::str_match(spec, "^CG(\\d+)")[,2]),
+                    real  = grepl("_real_rate", basename(path))) %>%
+      dplyr::arrange(cgnum, dplyr::desc(real))
+    return(df$path[1])
+  }
+  files_dk <- list.files("out_models",
+                         pattern=paste0("^fe_results_", panel, "_", dv, "_(CG\\d+_.+?)_DK\\.csv$"),
+                         full.names = TRUE)
+  if(length(files_dk) > 0){
+    df <- tibble(path = files_dk) %>%
+      dplyr::mutate(spec = stringr::str_match(basename(path), "_(CG\\d+_.+?)_DK\\.csv$")[,2],
+                    cgnum = as.integer(stringr::str_match(spec, "^CG(\\d+)")[,2]),
+                    real  = grepl("_real_rate", basename(path))) %>%
+      dplyr::arrange(cgnum, dplyr::desc(real))
+    return(df$path[1])
+  }
+  NA_character_
+}
+extract_rep_signs <- function(panel, dv){
+  f <- grab_rep_file(panel, dv)
+  if(is.na(f) || !file.exists(f)) {
+    return(tibble(
+      panel=panel, dv=dv,
+      FErep_spec="--", FErep_se="--",
+      FErep_sign_gdp="", FErep_star_gdp="",
+      FErep_sign_unemp="", FErep_star_unemp="",
+      FErep_sign_infl="", FErep_star_infl="",
+      FErep_rate_term="--", FErep_sign_rate="", FErep_star_rate="",
+      FErep_sign_gap="", FErep_star_gap="",
+      FErep_sign_lagcg="", FErep_star_lagcg=""
+    ))
+  }
+  cf <- readr::read_csv(f, show_col_types = FALSE)
+  
+  cand <- intersect(c("real_rate_cs","real_rate","policy_rate"), cf$term)
+  if (length(cand)) {
+    rate_term <- cand[1]
+  } else if (any(grepl("(^|_)real[_ ]?rate(_cs)?($|_)", cf$term))) {
+    rate_term <- cf$term[grepl("(^|_)real[_ ]?rate(_cs)?($|_)", cf$term)][1]
+  } else if (any(grepl("(^|_)policy[_ ]?rate($|_)", cf$term))) {
+    rate_term <- cf$term[grepl("(^|_)policy[_ ]?rate($|_)", cf$term)][1]
+  } else {
+    rate_term <- NA_character_
+  }
+  
+  lagcg_term <- if(any(grepl("^lag\\(credit_growth,\\s*\\d+\\)$", cf$term))) {
+    cf$term[grepl("^lag\\(credit_growth,\\s*\\d+\\)$", cf$term)][1]
+  } else NA_character_
+  
+  get <- function(term){
+    if(is.na(term)) return(c(sign="", stars=""))
+    row <- cf %>% dplyr::filter(term == !!term) %>% dplyr::slice(1)
+    if(nrow(row)==0) return(c(sign="", stars=""))
+    c(sign = sgn(row$beta), stars = star(row$p))
+  }
+  
+  tibble(
+    panel=panel, dv=dv,
+    FErep_spec = stringr::str_match(basename(f), "_(CG\\d+_.+?)_(DK|CLUSTER)\\.csv$")[,2],
+    FErep_se   = stringr::str_match(basename(f), "_(DK|CLUSTER)\\.csv$")[,2],
+    FErep_sign_gdp   = get("gdp_growth")["sign"], FErep_star_gdp = get("gdp_growth")["stars"],
+    FErep_sign_unemp = get("unemployment_rate")["sign"], FErep_star_unemp = get("unemployment_rate")["stars"],
+    FErep_sign_infl  = get("inflation")["sign"], FErep_star_infl = get("inflation")["stars"],
+    FErep_rate_term  = ifelse(is.na(rate_term),"--",rate_term),
+    FErep_sign_rate  = get(rate_term)["sign"],  FErep_star_rate  = get(rate_term)["stars"],
+    FErep_sign_gap   = get("credit_to_gdp_gap")["sign"], FErep_star_gap = get("credit_to_gdp_gap")["stars"],
+    FErep_sign_lagcg = get(lagcg_term)["sign"], FErep_star_lagcg = get(lagcg_term)["stars"]
+  )
 }
 
-message("\nDone.")
+rep_signs <- fe_diags %>%
+  dplyr::distinct(panel, dv) %>%
+  dplyr::arrange(panel, dv) %>%
+  purrr::pmap_dfr(~extract_rep_signs(..1, ..2))
 
+fe_diags_plus <- fe_diags %>%
+  dplyr::left_join(rep_signs, by=c("panel","dv")) %>%
+  dplyr::mutate(
+    GDP    = paste0(FErep_sign_gdp, FErep_star_gdp),
+    UNEMP  = paste0(FErep_sign_unemp, FErep_star_unemp),
+    INFL   = paste0(FErep_sign_infl, FErep_star_infl),
+    has_rate_in_controls = grepl("(real_rate_cs|real_rate|policy_rate)", controls_used),
+    RATE   = dplyr::case_when(
+      FErep_rate_term == "--" & has_rate_in_controls ~ "absorbed by year FE",
+      FErep_rate_term == "--" ~ "--",
+      TRUE ~ paste0(FErep_rate_term, ":", FErep_sign_rate, FErep_star_rate)
+    ),
+    GAP    = paste0(FErep_sign_gap, FErep_star_gap),
+    L_CG   = dplyr::if_else(FErep_sign_lagcg=="", "--", paste0(FErep_sign_lagcg, FErep_star_lagcg)),
+    FErep_choice = paste0(FErep_spec, " / ", FErep_se)
+  )
+
+out_diag_plus_csv <- file.path("out_models","fe_diagnostics_plus_signs.csv")
+readr::write_csv(fe_diags_plus, out_diag_plus_csv)
+
+{
+  op <- options(na.print = "NA")
+  on.exit(options(op), add = TRUE)
+  fe_diags_plus %>%
+    dplyr::select(panel, dv, se_type, FE_vs_pooled_p, Hausman_p, FE_preferred,
+                  rate_used, cg_lag, controls_used, GDP, UNEMP, INFL, RATE, GAP, L_CG, FErep_choice) %>%
+    dplyr::arrange(panel, dv, se_type) %>%
+    as.data.frame() %>%
+    print(row.names = FALSE)
+}
+
+out_diag_plus_tex <- file.path("out_tex","fe_diagnostics_plus_signs.tex")
+con2 <- file(out_diag_plus_tex, "w")
+cat("\\scriptsize\n\\setlength{\\tabcolsep}{4.5pt}\n\\setlength\\LTleft{0pt}\n\\setlength\\LTright{0pt}\n",
+    "\\begin{longtable}{l l r r r l r r c l l l l l l l l}\n",
+    "\\caption{Two-way FE diagnostics with baseline (CLUSTER, CG1) coefficient signs}\\label{tab:fe_diags_plus}\\\\\n",
+    "\\hline\n",
+    "Panel & DV & N & Ctries & Years & SEs & pF (FE vs pooled) & Hausman & FE pref & Rate & CG lag & GDP & UNEMP & INFL & RATE & GAP & L.CG \\\\\\hline\n",
+    "\\endfirsthead\n\\hline\n",
+    "Panel & DV & N & Ctries & Years & SEs & pF (FE vs pooled) & Hausman & FE pref & Rate & CG lag & GDP & UNEMP & INFL & RATE & GAP & L.CG \\\\\\hline\n",
+    "\\endhead\n", file = con2)
+for(i in seq_len(nrow(fe_diags_plus))){
+  r <- fe_diags_plus[i,]
+  cat(sprintf("%s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s\\\\\n",
+              fmt_txt(r$panel),
+              fmt_txt(r$dv),
+              fmt_int(r$N),
+              fmt_int(r$countries),
+              fmt_int(r$years),
+              fmt_txt(r$se_type),
+              fmt_p(r$FE_vs_pooled_p),
+              fmt_p(r$Hausman_p),
+              ifelse(isTRUE(r$FE_preferred),"Yes","No"),
+              fmt_txt(r$rate_used),
+              fmt_txt(r$cg_lag),
+              fmt_txt(r$GDP),
+              fmt_txt(r$UNEMP),
+              fmt_txt(r$INFL),
+              fmt_txt(r$RATE),
+              fmt_txt(r$GAP),
+              fmt_txt(r$L_CG)),
+      file = con2)
+}
+cat("\\hline\n\\end{longtable}\n", file = con2)
+close(con2)
+
+message("Wrote:\n  - ", file.path("out_models","coef_signs_summary_FE_only.csv"),
+        "\n  - ", file.path("out_tex","coef_signs_summary_FE_only.tex"),
+        "\n  - ", out_diag_plus_csv,
+        "\n  - ", out_diag_plus_tex,
+        "\n  - ", file.path("out_models","fe_diagnostics_summary_all.csv"),
+        "\n  - ", tex_diag,
+        "\nAnd coefficient PNGs in out_figs/")
+
+## =======================================================================================
+
+# collect_coefficients.R — gather FE & GMM coefficients and show signs (CLUSTER-preferred)
+
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(tidyr); library(purrr)
+})
+
+dir.create("out_tex", showWarnings = FALSE, recursive = TRUE)
+
+star <- function(p) ifelse(is.na(p),"",
+                           ifelse(p<.01,"***", ifelse(p<.05,"**", ifelse(p<.10,"*",""))))
+
+# ---- System-GMM ----
+gmm_files <- list.files("out_models", pattern="^sysgmm_results_(.+?)_(.+?)\\.csv$", full.names = TRUE)
+gmm_tbl <- map_dfr(gmm_files, function(f){
+  m <- str_match(basename(f), "^sysgmm_results_(.+?)_(.+?)\\.csv$")
+  panel <- m[2]; dv <- m[3]
+  readr::read_csv(f, show_col_types = FALSE) %>%
+    mutate(panel=panel, dv=dv, method="System-GMM",
+           sign=case_when(beta > 0 ~ "+", beta < 0 ~ "−", TRUE ~ "0"),
+           stars=star(p)) %>%
+    select(panel, dv, method, term, beta, se, p, stars, sign)
+})
+
+# ---- FE (prefer CLUSTER for consistency) ----
+fe_files <- list.files("out_models", pattern="^fe_results_(.+?)_(.+?)_(CG\\d+_.+?)_(CLUSTER|DK)\\.csv$", full.names = TRUE)
+fe_tbl <- map_dfr(fe_files, function(f){
+  m <- str_match(basename(f), "^fe_results_(.+?)_(.+?)_(CG\\d+_.+?)_(CLUSTER|DK)\\.csv$")
+  panel <- m[2]; dv <- m[3]; spec <- m[4]; se_type <- m[5]
+  readr::read_csv(f, show_col_types = FALSE) %>%
+    mutate(panel=panel, dv=dv, method=paste0("FE(",se_type,")"), spec=spec,
+           sign=case_when(beta > 0 ~ "+", beta < 0 ~ "−", TRUE ~ "0"),
+           stars=star(p)) %>%
+    select(panel, dv, method, spec, term, beta, se, p, stars, sign)
+})
+
+fe_tbl_pref <- fe_tbl %>%
+  mutate(pref = ifelse(grepl("^FE\\(CLUSTER\\)", method), 1L, 2L)) %>%
+  group_by(panel, dv, term) %>%
+  arrange(pref, .by_group=TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-pref)
+
+# ---- Combine and print tidy sign summary for key terms ----
+key_terms <- c("lag(npl_ratio_filled, 1)","lag(log_bank_z_score, 1)","lag(capital_adequacy_ratio_filled, 1)",
+               "gdp_growth","unemployment_rate","inflation","real_rate","real_rate_cs","policy_rate")
+
+sign_summary <- bind_rows(
+  gmm_tbl %>% mutate(spec=NA_character_) %>% select(panel,dv,method,spec,term,sign,stars,beta,se,p),
+  fe_tbl_pref
+) %>%
+  filter(term %in% key_terms) %>%
+  arrange(panel, dv, method, term)
+
+print(sign_summary %>% select(panel, dv, method, term, sign, stars, beta, se, p), n=200)
+
+# Save CSV
+readr::write_csv(sign_summary, file.path("out_models","coef_signs_summary_FE_and_GMM.csv"))
+
+# Save LaTeX longtable
+tex <- file.path("out_tex","coef_signs_summary_FE_and_GMM.tex")
+cat("\\scriptsize\n\\setlength{\\tabcolsep}{4.5pt}\n\\setlength\\LTleft{0pt}\n\\setlength\\LTright{0pt}\n",
+    "\\begin{longtable}{l l l l c c r r r}\n\\hline\n",
+    "Panel & DV & Method & Term & Sign & Stars & $\\beta$ & SE & $p$ \\\\\\hline\n", file=tex)
+apply(sign_summary, 1, function(r){
+  cat(sprintf("%s & %s & %s & %s & %s & %s & %.6f & %.6f & %.3f\\\\\n",
+              r[["panel"]], r[["dv"]], r[["method"]],
+              gsub("_","\\_", r[["term"]], fixed=TRUE),
+              r[["sign"]], r[["stars"]],
+              as.numeric(r[["beta"]]), as.numeric(r[["se"]]), as.numeric(r[["p"]])),
+      file=tex, append=TRUE)
+})
+cat("\\hline\n\\end{longtable}\n", file=tex, append=TRUE)
+
+message("\nWrote: out_models/coef_signs_summary_FE_and_GMM.csv and out_tex/coef_signs_summary_FE_and_GMM.tex")
 
