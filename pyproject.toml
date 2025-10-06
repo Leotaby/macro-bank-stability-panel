@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "macro_bank_stability"
+version = "0.1.0"
+description = "Synthetic panel data analysis of macroeconomic determinants of bank stability using Python and statsmodels"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Leo"}]
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "statsmodels>=0.14",
+    "linearmodels>=5.1",
+    "matplotlib>=3.7",
+    "pytest>=7.3"
+]
