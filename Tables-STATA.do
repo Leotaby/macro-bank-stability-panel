@@ -189,7 +189,7 @@ esttab GMM_T1 using "out_tex/Table12_GMM_tier1.tex", replace ///
              "Time FE: 4-year bins as IVs; instrument count constrained (< number of countries).")
 
 * ============================================================
-* OPTIONAL ROBUSTNESS (keep on hand if asked in viva)
+* ROBUSTNESS
 * Tighter lag window L(2 2) for NPL to further discipline instruments
 * (often moves Hansen p upward while keeping signs)
 * ============================================================
